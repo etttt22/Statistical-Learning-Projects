@@ -1,0 +1,390 @@
+---
+title: "Untitled"
+author: "Yizhen Wang"
+date: "2025-12-02"
+output:
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(car)
+library(ggplot2)
+library(dplyr)
+library(MASS)
+library(glmnet)
+library(gbm)
+library(randomForest)
+library(knitr)
+library(kableExtra)
+```
+
+```{r}
+#Data preparation and EDA
+news <- read.csv("OnlineNewsPopularity.csv")
+y_raw  <- news$shares
+y_log  <- log1p(news$shares)   # log(shares + 1)
+y_sqrt <- sqrt(news$shares)
+
+par(mfrow = c(1, 3))
+hist(y_raw,  main = "shares",        xlab = "shares")
+hist(y_log,  main = "log(shares+1)", xlab = "log(shares+1)")
+hist(y_sqrt, main = "sqrt(shares)",  xlab = "sqrt(shares)")
+
+boxcox(lm(shares ~ . - url - timedelta - weekday_is_sunday - is_weekend, data = news))
+```
+
+```{r}
+#OLS
+model_ols <- lm( log(shares + 1) ~ . - url - timedelta - weekday_is_sunday - is_weekend, data = news)
+summary(model_ols)
+#chekc the ols model diagnostics
+par(mfrow=c(2,2))
+plot(model_ols)
+
+#VIF diagnositics
+v <- vif(model_ols)
+
+vif_df <- data.frame(
+  variable = names(v),
+  vif      = as.numeric(v)
+) %>%
+  arrange(desc(vif)) %>%
+  slice(1:10)
+
+
+ggplot(vif_df, aes(x = reorder(variable, vif), y = vif, fill = vif > 10)) +
+  geom_col() +
+  coord_flip() +
+  geom_hline(yintercept = 10, linetype = "dashed") +
+  scale_fill_manual(values = c("FALSE" = "grey70", "TRUE" = "red"),
+                    guide = "none") +
+  labs(x = "Predictor",
+       y = "VIF",
+       title = "Top 5 Highest Variance Inflation Factors (VIF) for OLS Model") +
+  theme_minimal()
+
+```
+```{r}
+#Ridge
+x <- model.matrix( log(shares + 1) ~ . - url - timedelta - weekday_is_sunday - is_weekend, data = news)[,-1]
+y <- log(news$shares + 1)
+
+set.seed(42)
+train_idx <- sample(seq_len(nrow(x)), size = 0.7 * nrow(x))
+x_train <- x[train_idx, ]
+x_test  <- x[-train_idx, ]
+y_train <- y[train_idx]
+y_test  <- y[-train_idx]
+
+cv_ridge <- cv.glmnet(x_train, y_train, alpha = 0)
+best_lambda_ridge <- cv_ridge$lambda.min
+
+model_ridge <- glmnet(x_train, y_train, alpha = 0, lambda = best_lambda_ridge)
+
+y_pred_test <- as.vector(predict(model_ridge, newx = x_test))
+resid_test  <- y_test - y_pred_test
+
+# RMSE and MAE on test set
+rmse_ridge <- sqrt(mean(resid_test^2))
+mae_ridge  <- mean(abs(resid_test))
+plot(y_pred_test, resid_test,
+     xlab = "Fitted values (test, ridge)",
+     ylab = "Residuals",
+     main = "Test Residuals vs Fitted (ridge)")
+abline(h = 0, lty = 2)
+cat("Ridge Regression Test RMSE:", rmse_ridge, "\n")
+
+y_pred_train <- as.vector(predict(model_ridge, newx = x_train))
+resid_train  <- y_train - y_pred_train
+
+mse_ridge_train  <- mean(resid_train^2)
+cat("Ridge Regression Train MSE:", mse_ridge_train, "\n")
+```
+```{r}
+#elastic net
+cv_elastic <- cv.glmnet(x_train, y_train, alpha = 0.5)
+best_lambda_elastic <- cv_elastic$lambda.min
+model_elastic <- glmnet(x_train, y_train, alpha = 0.5, lambda = best_lambda_elastic)
+y_pred_test_elastic <- as.vector(predict(model_elastic, newx = x_test))
+resid_test_elastic  <- y_test - y_pred_test_elastic
+# RMSE and MAE on test set
+rmse_elastic <- sqrt(mean(resid_test_elastic^2))
+mae_elastic  <- mean(abs(resid_test_elastic))
+plot(y_pred_test_elastic, resid_test_elastic,
+     xlab = "Fitted values (test, elastic net)",
+     ylab = "Residuals",
+     main = "Test Residuals vs Fitted (elastic net)")
+abline(h = 0, lty = 2)
+cat("Elastic Net Test RMSE:", rmse_elastic, "\n")
+cat("Elastic Net Test MAE :", mae_elastic,  "\n")
+```
+```{r}
+#PCR
+library(pls)
+
+set.seed(42)
+train_idx <- sample(seq_len(nrow(news)), size = 0.7 * nrow(news))
+train_data <- news[train_idx, ]
+test_data  <- news[-train_idx, ]
+
+model_pcr <- pcr(
+  log(shares + 1) ~ . - url - timedelta - weekday_is_sunday - is_weekend,
+  data       = train_data,
+  scale      = TRUE,
+  validation = "CV"
+)
+
+validationplot(model_pcr, val.type = "RMSEP")
+
+rmsep <- RMSEP(model_pcr)
+opt_ncomp <- which.min(rmsep$val[1, 1, -1])  
+
+# Predict on TEST set
+y_test  <- log(test_data$shares + 1)
+y_pred_test_pcr <- as.vector(
+  predict(model_pcr, newdata = test_data, ncomp = opt_ncomp)
+)
+
+resid_test_pcr <- y_test - y_pred_test_pcr
+rmse_pcr <- sqrt(mean(resid_test_pcr^2))
+mae_pcr  <- mean(abs(resid_test_pcr))
+
+cat("PCR Test RMSE:", rmse_pcr, "\n")
+cat("PCR Test MAE :", mae_pcr,  "\n")
+```
+
+```{r}
+#PCR ctd
+L <- loadings(model_pcr)   
+dim(L)
+
+pc1_load <- L[, 1]
+sort(pc1_load, decreasing = TRUE)[1:10]     # most positive contributors
+sort(pc1_load, decreasing = FALSE)[1:10]    # most negative
+
+coef_pcr <- coef(model_pcr, ncomp = opt_ncomp, intercept = TRUE)
+# coefficient for PC1 in the component space:
+beta_pc1 <- summary(model_pcr)$coefficients[1, "Estimate"]
+
+# plot for PC1
+ggplot(data = data.frame(PC1 = model_pcr$scores[, 1],
+                         shares = train_data$shares),
+       aes(x = PC1, y = shares)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(x = "PC1",
+       y = "shares",
+       title = "PCR: PC1 vs shares") +
+  theme_minimal()
+```
+
+
+```{r}
+#use gbm
+set.seed(42)
+model_gbm <- gbm(
+  formula = log(shares + 1) ~ . - url - timedelta - weekday_is_sunday - is_weekend,
+  data    = train_data,
+  distribution = "gaussian",
+  n.trees      = 1000,
+  interaction.depth = 3,
+  shrinkage        = 0.01,
+  n.minobsinnode  = 20,
+  verbose         = FALSE
+)
+y_pred_test_gbm <- predict(model_gbm, newdata = test_data, n.trees = 5000)
+resid_test_gbm  <- log(test_data$shares + 1) - y_pred_test_gbm
+rmse_gbm <- sqrt(mean(resid_test_gbm^2))
+mae_gbm  <- mean(abs(resid_test_gbm))
+plot(y_pred_test_gbm, resid_test_gbm,
+     xlab = "Fitted values (test, GBM)",
+     ylab = "Residuals",
+     main = "Test Residuals vs Fitted (GBM)")
+abline(h = 0, lty = 2)
+cat("GBM Test RMSE:", rmse_gbm, "\n")
+```
+
+```{r}
+#Random Forest,
+set.seed(42)
+
+D1 <- 1400
+
+news$popular <- factor(ifelse(news$shares > D1, "popular", "unpopular"))
+test_data$popular  <- factor(ifelse(test_data$shares > D1, "popular", "unpopular"))
+train_data$popular <- factor(ifelse(train_data$shares > D1, "popular", "unpopular"))
+
+metrics <- function(truth, pred, positive = "popular") {
+  truth <- factor(truth, levels = c("unpopular", "popular"))
+  pred  <- factor(pred,  levels = c("unpopular", "popular"))
+  tab   <- table(truth, pred)
+
+  acc  <- sum(diag(tab)) / sum(tab)
+  prec <- tab[positive, positive] / sum(tab[, positive])
+  rec  <- tab[positive, positive] / sum(tab[positive, ])
+  f1   <- 2 * prec * rec / (prec + rec)
+
+  list(accuracy = acc, precision = prec, recall = rec, F1 = f1, confusion = tab)
+}
+
+rf_clf <- randomForest(
+  popular ~ . - url - shares - timedelta - weekday_is_sunday - is_weekend,
+  data  = train_data,
+  ntree = 500,
+  importance = TRUE
+)
+
+pred_clf_prob <- predict(rf_clf, newdata = test_data, type = "prob")[, "popular"]
+pred_clf      <- ifelse(pred_clf_prob > 0.5, "popular", "unpopular")
+
+# Classification metrics
+m_clf <- metrics(test_data$popular, pred_clf)
+
+cat("=== RF CLASSIFICATION (Fernandes-style) ===\n")
+print(m_clf$confusion)
+cat(sprintf("Accuracy : %.3f\n", m_clf$accuracy))
+cat(sprintf("Precision: %.3f\n", m_clf$precision))
+cat(sprintf("Recall   : %.3f\n", m_clf$recall))
+cat(sprintf("F1       : %.3f\n\n", m_clf$F1))
+
+#AUC
+library(pROC)
+roc_obj <- roc(test_data$popular, pred_clf_prob, levels = c("unpopular", "popular"))
+auc_value <- auc(roc_obj)
+cat(sprintf("AUC      : %.3f\n", auc_value))
+```
+```{r}
+#Build a wide table for classification metrics
+rf_tbl <- tibble(
+  Model     = "Random Forest (RF)",
+  Accuracy  = m_clf$accuracy,
+  Precision = m_clf$precision,
+  Recall    = m_clf$recall,
+  F1        = m_clf$F1,
+  AUC       = as.numeric(auc_value)
+) %>%
+  mutate(across(where(is.numeric), ~ round(., 2)))  # round to 2 decimals
+
+kable(
+  rf_tbl,
+  # format   = "latex",   # use "html" if knitting to HTML
+  booktabs = TRUE,
+  caption  = "Random Forest classification performance"
+) %>%
+  kable_styling()
+
+```
+
+```{r}
+#ROC plot
+plot(roc_obj, main = "ROC Curve for Random Forest Classifier", col = "blue", lwd = 2)
+abline(a = 0, b = 1, lty = 2, col = "red")
+legend("bottomright", legend = sprintf("AUC = %.3f", auc_value), col = "blue", lwd = 2)
+```
+
+```{r}
+#Variable importance plot
+importance_vals <- importance(rf_clf)
+importance_df <- data.frame(
+  Variable = rownames(importance_vals),
+  Importance = importance_vals[, "MeanDecreaseGini"]
+) %>%
+  arrange(desc(Importance)) %>%
+  slice(1:10)
+ggplot(importance_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(x = "Variable",
+       y = "Mean Decrease in Gini",
+       title = "Top 10 Important Variables in Random Forest Classifier") +
+  theme_minimal()
+```
+```{r}
+#Apply rf regression first, then divide the predicted values into popular and unpopular, then compute the classification metrics, then compare the results with the previous rf classification model
+set.seed(42)
+model_rf_reg <- randomForest(
+  log(shares + 1) ~ . - url - timedelta - weekday_is_sunday - is_weekend - popular,
+  data  = train_data,
+  ntree = 200,
+  importance = TRUE
+)
+y_pred_test_rf_reg <- predict(model_rf_reg, newdata = test_data)
+y_pred_test_rf_reg_exp <- exp(y_pred_test_rf_reg) - 1
+pred_clf_reg <- ifelse(y_pred_test_rf_reg_exp > D1, "popular", "unpopular")
+m_clf_reg <- metrics(test_data$popular, pred_clf_reg)
+cat("=== RF REGRESSION-BASED CLASSIFICATION ===\n")
+print(m_clf_reg$confusion)
+cat(sprintf("Accuracy : %.3f\n", m_clf_reg$accuracy))
+cat(sprintf("Precision: %.3f\n", m_clf_reg$precision))
+cat(sprintf("Recall   : %.3f\n", m_clf_reg$recall))
+cat(sprintf("F1       : %.3f\n\n", m_clf_reg$F1))
+#AUC
+roc_obj_reg <- roc(test_data$popular, y_pred_test_rf_reg_exp, levels = c("unpopular", "popular"))
+auc_value_reg <- auc(roc_obj_reg)
+cat(sprintf("AUC      : %.3f\n", auc_value_reg))
+```
+```{r}
+
+#Table comparing the two RF classification approaches
+rf_reg_tbl <- tibble(
+  Model     = "RF Regression-based Classification",
+  Accuracy  = m_clf_reg$accuracy,
+  Precision = m_clf_reg$precision,
+  Recall    = m_clf_reg$recall,
+  F1        = m_clf_reg$F1,
+  AUC       = as.numeric(auc_value_reg)
+) %>%
+  mutate(across(where(is.numeric), ~ round(., 2)))  # round to 2 decimals
+```
+```{r}
+#RMSE for RF regression
+# true response on test set (log scale)
+y_test_reg <- log(test_data$shares + 1)
+
+# RF regression predictions
+y_pred_reg <- predict(model_rf_reg, newdata = test_data)
+
+# residuals
+resid_rf <- y_test_reg - y_pred_reg
+
+# RMSE & MAE
+rmse_rf <- sqrt(mean(resid_rf^2))
+mae_rf  <- mean(abs(resid_rf))
+
+cat("RF Regression Test RMSE:", rmse_rf, "\n")
+cat("RF Regression Test MAE :", mae_rf,  "\n")
+```
+```{r}
+#RMSE for OLS
+# true response on test set (log scale)
+y_test_ols <- log(test_data$shares + 1)
+# OLS predictions
+y_pred_ols <- predict(model_ols, newdata = test_data)
+# residuals
+resid_ols <- y_test_ols - y_pred_ols
+# RMSE & MAE
+rmse_ols <- sqrt(mean(resid_ols^2))
+mae_ols  <- mean(abs(resid_ols))
+cat("OLS Test RMSE:", rmse_ols, "\n")
+cat("OLS Test MAE :", mae_ols,  "\n")
+
+
+#Summarize all RMSE in a table
+rmse_tbl <- tibble(
+  Model = c("OLS", "Ridge Regression", "Elastic Net", "PCR", "GBM", "RF Regression"),
+  RMSE  = c(rmse_ols, rmse_ridge, rmse_elastic, rmse_pcr, rmse_gbm, rmse_rf),
+  MAE   = c(mae_ols, mae_ridge, mae_elastic, mae_pcr, mae_gbm, mae_rf)
+) %>%
+  mutate(across(where(is.numeric), ~ round(., 2)))  # round to 2 decimals
+kable(
+  rmse_tbl,
+  # format   = "latex",   # use "html" if knitting to HTML
+  booktabs = TRUE,
+  caption  = "Regression Model Performance on Test Set"
+) %>%
+  kable_styling()
+
+```
+
